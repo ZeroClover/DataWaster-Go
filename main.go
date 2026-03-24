@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -44,6 +46,7 @@ type Stats struct {
 	LastTime     time.Time
 	MaxSpeed     float64
 	CurrentSpeed float64
+	ECHAccepted  bool
 	mu           sync.RWMutex
 }
 
@@ -99,11 +102,14 @@ func (s *Stats) GetTotalBytes() int64 {
 }
 
 var (
-	config Config
-	stats  Stats
-	logger *log.Logger
-	cancel context.CancelFunc
-	ctx    context.Context
+	config      Config
+	stats       Stats
+	logger      *log.Logger
+	cancel      context.CancelFunc
+	ctx         context.Context
+	echConfig   []byte      // Cached ECH configuration
+	echConfigMu sync.Mutex  // Protects echConfig
+	echFetched  bool        // Whether ECH config has been fetched
 )
 
 func init() {
@@ -133,7 +139,7 @@ func init() {
 func checkFlagConflicts() {
 	args := os.Args[1:]
 
-	// First, check if help flag is present
+	// Check if help flag is present
 	var hasHelp bool
 	var helpFlag string
 	for _, arg := range args {
@@ -144,12 +150,11 @@ func checkFlagConflicts() {
 		}
 	}
 
-	// If help flag is present, check if there are other flags
+	// Check if help flag is used with other flags
 	if hasHelp {
 		var otherFlags []string
 		for _, arg := range args {
 			if arg != helpFlag && strings.HasPrefix(arg, "-") {
-				// Exclude the help flag itself
 				otherFlags = append(otherFlags, arg)
 			}
 		}
@@ -159,12 +164,10 @@ func checkFlagConflicts() {
 			fmt.Fprintf(os.Stderr, "Use '%s' alone to show help information.\n", helpFlag)
 			os.Exit(1)
 		}
-		// If help is present and no other flags, we can return early
-		// The help will be processed normally by flag.Parse()
 		return
 	}
 
-	// Check for short/long form conflicts for other flags
+	// Check for short/long form conflicts
 	conflictPairs := map[string][]string{
 		"help":      {"-h", "--help"},
 		"down":      {"-d", "--down"},
@@ -224,7 +227,7 @@ func main() {
 	setupLogger()
 	setupSignalHandler()
 
-	// Validate interface early if specified
+	// Validate interface if specified
 	if config.Interface != "" {
 		if _, err := net.InterfaceByName(config.Interface); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: Interface '%s' not found\n", config.Interface)
@@ -244,6 +247,17 @@ func main() {
 
 	stats.StartTime = time.Now()
 	stats.LastTime = time.Now()
+
+	// Pre-fetch ECH configuration
+	debugf("Pre-fetching ECH configuration before starting test...")
+	_, _ = fetchECHConfig("speed.cloudflare.com")
+
+	// Pre-resolve IP addresses using DoH
+	debugf("Pre-resolving IP addresses via DoH before starting test...")
+	_, err := resolveHostnameViaDoH("speed.cloudflare.com")
+	if err != nil {
+		logger.Printf("Warning: Failed to resolve IPs via DoH: %v (will use system DNS as fallback)", err)
+	}
 
 	if config.Down {
 		performDownloadTest()
@@ -298,7 +312,6 @@ func setupSignalHandler() {
 		stats.EndTime = time.Now()
 		cancel()
 
-		// Give a small delay to let display routine finish
 		time.Sleep(100 * time.Millisecond)
 	}()
 
@@ -313,20 +326,15 @@ func setupSignalHandler() {
 
 // happyEyeballsDialContext implements Happy Eyeballs algorithm
 func happyEyeballsDialContext(ctx context.Context, dialer *net.Dialer, network, addr string) (net.Conn, error) {
-	// This function should only be called when no IP version is forced
-	// (-4 and -6 cases are handled separately with fatal errors)
-
-	// Check if we have interface binding that restricts IP version
+	// Check interface binding IP version restrictions
 	var canUseIPv4, canUseIPv6 bool = true, true
 
 	if dialer.LocalAddr != nil {
 		if tcpAddr, ok := dialer.LocalAddr.(*net.TCPAddr); ok {
 			if tcpAddr.IP.To4() != nil {
-				// Bound to IPv4 address - can only use IPv4
 				canUseIPv6 = false
 				debugf("Happy Eyeballs: Interface bound to IPv4 %s, IPv6 disabled", tcpAddr.IP)
 			} else {
-				// Bound to IPv6 address - can only use IPv6
 				canUseIPv4 = false
 				debugf("Happy Eyeballs: Interface bound to IPv6 %s, IPv4 disabled", tcpAddr.IP)
 			}
@@ -339,14 +347,28 @@ func happyEyeballsDialContext(ctx context.Context, dialer *net.Dialer, network, 
 		return nil, err
 	}
 
-	// Resolve both IPv4 and IPv6 addresses
+	// Resolve addresses
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	// Get all IPs for the host
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, err
+	// Use DoH-resolved IPs if cached
+	var ips []net.IPAddr
+	resolvedIPsMu.RLock()
+	cachedIPs, hasCached := resolvedIPs[host]
+	resolvedIPsMu.RUnlock()
+
+	if hasCached {
+		debugf("Happy Eyeballs: Using DoH-resolved IPs for %s", host)
+		for _, ip := range cachedIPs {
+			ips = append(ips, net.IPAddr{IP: ip})
+		}
+	} else {
+		debugf("Happy Eyeballs: Using system DNS for %s (DoH cache miss)", host)
+		var lookupErr error
+		ips, lookupErr = net.DefaultResolver.LookupIPAddr(ctx, host)
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
 	}
 
 	var ipv4Addrs, ipv6Addrs []net.IP
@@ -361,7 +383,6 @@ func happyEyeballsDialContext(ctx context.Context, dialer *net.Dialer, network, 
 	debugf("Happy Eyeballs: found %d usable IPv4 and %d usable IPv6 addresses for %s",
 		len(ipv4Addrs), len(ipv6Addrs), host)
 
-	// If only one protocol available, use it
 	if len(ipv6Addrs) == 0 && len(ipv4Addrs) > 0 {
 		debugf("Happy Eyeballs: using IPv4 only")
 		return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(ipv4Addrs[0].String(), port))
@@ -371,7 +392,6 @@ func happyEyeballsDialContext(ctx context.Context, dialer *net.Dialer, network, 
 		return dialer.DialContext(ctx, "tcp6", net.JoinHostPort(ipv6Addrs[0].String(), port))
 	}
 
-	// Both protocols available - race them
 	if len(ipv4Addrs) > 0 && len(ipv6Addrs) > 0 {
 		return raceConnections(ctx, dialer, ipv4Addrs[0], ipv6Addrs[0], port)
 	}
@@ -392,21 +412,20 @@ func raceConnections(ctx context.Context, dialer *net.Dialer, ipv4, ipv6 net.IP,
 
 	results := make(chan connResult, 2)
 
-	// Start IPv6 connection immediately
+	// Start IPv6 connection
 	go func() {
 		addr := net.JoinHostPort(ipv6.String(), port)
 		conn, err := dialer.DialContext(ctx, "tcp6", addr)
 		results <- connResult{conn: conn, err: err, ipv6: true}
 	}()
 
-	// Start IPv4 connection after 250ms delay (Happy Eyeballs standard)
+	// Start IPv4 connection after 250ms delay
 	go func() {
 		select {
 		case <-ctx.Done():
 			results <- connResult{err: ctx.Err(), ipv6: false}
 			return
 		case <-time.After(250 * time.Millisecond):
-			// Start IPv4 attempt
 		}
 
 		addr := net.JoinHostPort(ipv4.String(), port)
@@ -428,9 +447,8 @@ func raceConnections(ctx context.Context, dialer *net.Dialer, ipv4, ipv6 net.IP,
 				}
 				debugf("Happy Eyeballs: %s connection succeeded first", protocol)
 
-				// Cancel any remaining connection attempts
+				// Close remaining connections
 				go func() {
-					// Drain remaining results and close failed connections
 					for j := i + 1; j < 2; j++ {
 						if remaining := <-results; remaining.conn != nil {
 							remaining.conn.Close()
@@ -448,28 +466,40 @@ func raceConnections(ctx context.Context, dialer *net.Dialer, ipv4, ipv6 net.IP,
 	return nil, fmt.Errorf("all connection attempts failed, last error: %v", lastErr)
 }
 
-// forcedIPVersionDialContext enforces specific IP version with fatal error if unavailable
+// forcedIPVersionDialContext enforces specific IP version
 func forcedIPVersionDialContext(ctx context.Context, dialer *net.Dialer, network, addr string) (net.Conn, error) {
-	// Parse host and port
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Resolve addresses
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, fmt.Errorf("DNS resolution failed for %s: %v", host, err)
+	// Use DoH-resolved IPs if cached
+	var ips []net.IPAddr
+	resolvedIPsMu.RLock()
+	cachedIPs, hasCached := resolvedIPs[host]
+	resolvedIPsMu.RUnlock()
+
+	if hasCached {
+		debugf("Forced IP version: Using DoH-resolved IPs for %s", host)
+		for _, ip := range cachedIPs {
+			ips = append(ips, net.IPAddr{IP: ip})
+		}
+	} else {
+		debugf("Forced IP version: Using system DNS for %s (DoH cache miss)", host)
+		var lookupErr error
+		ips, lookupErr = net.DefaultResolver.LookupIPAddr(ctx, host)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("DNS resolution failed for %s: %v", host, lookupErr)
+		}
 	}
 
 	var targetIP net.IP
 	var targetNetwork string
 
 	if config.IPv4Only {
-		// Look for IPv4 address
 		for _, ip := range ips {
 			if ip.IP.To4() != nil {
 				targetIP = ip.IP
@@ -483,7 +513,6 @@ func forcedIPVersionDialContext(ctx context.Context, dialer *net.Dialer, network
 		}
 		debugf("IPv4-only: using %s", targetIP)
 	} else if config.IPv6Only {
-		// Look for IPv6 address
 		for _, ip := range ips {
 			if ip.IP.To4() == nil {
 				targetIP = ip.IP
@@ -498,7 +527,7 @@ func forcedIPVersionDialContext(ctx context.Context, dialer *net.Dialer, network
 		debugf("IPv6-only: using %s", targetIP)
 	}
 
-	// Connect to the specific IP
+	// Connect to specific IP
 	targetAddr := net.JoinHostPort(targetIP.String(), port)
 	return dialer.DialContext(ctx, targetNetwork, targetAddr)
 }
@@ -564,9 +593,8 @@ func bindToInterfaceDarwin(fd int, interfaceName string, isIPv6 bool) error {
 	return nil
 }
 
-// createInterfaceBoundDialer creates a dialer that binds to a specific interface using OS-appropriate methods
+// createInterfaceBoundDialer creates a dialer bound to a specific interface
 func createInterfaceBoundDialer() (*net.Dialer, error) {
-	// If no interface specified, create standard dialer (IP version control happens in transport layer)
 	if config.Interface == "" {
 		return &net.Dialer{Timeout: 5 * time.Second}, nil
 	}
@@ -589,7 +617,7 @@ func createInterfaceBoundDialer() (*net.Dialer, error) {
 		debugf("  Address %d: %s", i, addr.String())
 	}
 
-	// Analyze available addresses for validation
+	// Check available IP versions
 	var hasIPv4, hasIPv6 bool
 	for _, addr := range addrs {
 		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
@@ -603,7 +631,7 @@ func createInterfaceBoundDialer() (*net.Dialer, error) {
 		}
 	}
 
-	// Validate IP version availability against user flags
+	// Validate IP version availability
 	if config.IPv4Only && !hasIPv4 {
 		return nil, fmt.Errorf("IPv4-only mode requested but no IPv4 address found on interface %s", config.Interface)
 	}
@@ -613,7 +641,6 @@ func createInterfaceBoundDialer() (*net.Dialer, error) {
 
 	debugf("Using OS-specific interface binding for %s (OS: %s)", config.Interface, runtime.GOOS)
 
-	// Create dialer with OS-specific interface binding
 	dialer := &net.Dialer{
 		Timeout: 5 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -623,7 +650,6 @@ func createInterfaceBoundDialer() (*net.Dialer, error) {
 
 				switch runtime.GOOS {
 				case "linux":
-					// Linux: Use SO_BINDTODEVICE to bind directly to interface name
 					if err := bindToInterfaceLinux(intFd, config.Interface); err != nil {
 						operr = fmt.Errorf("failed to bind to interface %s on Linux: %v", config.Interface, err)
 						logger.Printf("Linux interface binding failed: %v", operr)
@@ -632,8 +658,6 @@ func createInterfaceBoundDialer() (*net.Dialer, error) {
 					}
 
 				case "darwin":
-					// macOS: Use IP_BOUND_IF/IPV6_BOUND_IF based on socket family
-					// More accurate detection: check if the network explicitly contains "6" (tcp6/udp6)
 					isIPv6 := network == "tcp6" || network == "udp6" || strings.HasSuffix(network, "6")
 					if err := bindToInterfaceDarwin(intFd, config.Interface, isIPv6); err != nil {
 						operr = fmt.Errorf("failed to bind to interface %s on macOS: %v", config.Interface, err)
@@ -648,7 +672,6 @@ func createInterfaceBoundDialer() (*net.Dialer, error) {
 					}
 
 				default:
-					// Fallback for other operating systems - try Linux method
 					debugf("Warning: Unsupported OS %s, trying Linux-style binding", runtime.GOOS)
 					if err := bindToInterfaceLinux(intFd, config.Interface); err != nil {
 						operr = fmt.Errorf("failed to bind to interface %s on %s: %v", config.Interface, runtime.GOOS, err)
@@ -707,26 +730,375 @@ func testReachability(dialer *net.Dialer) {
 	}
 }
 
+// DoHResponse represents DNS-over-HTTPS JSON response
+type DoHResponse struct {
+	Status int `json:"Status"`
+	Answer []struct {
+		Name string `json:"name"`
+		Type int    `json:"type"`
+		TTL  int    `json:"TTL"`
+		Data string `json:"data"`
+	} `json:"Answer"`
+}
+
+// resolvedIPs stores resolved IP addresses to avoid repeated DNS queries
+var (
+	resolvedIPsMu sync.RWMutex
+	resolvedIPs   = make(map[string][]net.IP)
+)
+
+// resolveHostnameViaDoH resolves hostname using DNS-over-HTTPS
+func resolveHostnameViaDoH(hostname string) ([]net.IP, error) {
+	// Check cache
+	resolvedIPsMu.RLock()
+	if ips, ok := resolvedIPs[hostname]; ok {
+		resolvedIPsMu.RUnlock()
+		debugf("DoH DNS: Using cached IPs for %s (%d addresses)", hostname, len(ips))
+		return ips, nil
+	}
+	resolvedIPsMu.RUnlock()
+
+	debugf("DoH DNS: Resolving %s via DNS-over-HTTPS", hostname)
+
+	var allIPs []net.IP
+
+	// Query A record (IPv4)
+	ipv4s, err := queryDoHRecord(hostname, 1)
+	if err == nil {
+		for _, ip := range ipv4s {
+			debugf("DoH DNS: Resolved %s -> %s (IPv4)", hostname, ip)
+			allIPs = append(allIPs, ip)
+		}
+	} else {
+		debugf("DoH DNS: Failed to resolve A record for %s: %v", hostname, err)
+	}
+
+	// Query AAAA record (IPv6)
+	ipv6s, err := queryDoHRecord(hostname, 28)
+	if err == nil {
+		for _, ip := range ipv6s {
+			debugf("DoH DNS: Resolved %s -> %s (IPv6)", hostname, ip)
+			allIPs = append(allIPs, ip)
+		}
+	} else {
+		debugf("DoH DNS: Failed to resolve AAAA record for %s: %v", hostname, err)
+	}
+
+	if len(allIPs) == 0 {
+		return nil, fmt.Errorf("no IP addresses found for %s", hostname)
+	}
+
+	// Cache results
+	resolvedIPsMu.Lock()
+	resolvedIPs[hostname] = allIPs
+	resolvedIPsMu.Unlock()
+
+	return allIPs, nil
+}
+
+// queryDoHRecord queries a specific DNS record type via DoH
+func queryDoHRecord(hostname string, recordType int) ([]net.IP, error) {
+	dohURL := "https://cloudflare-dns.com/dns-query"
+	url := fmt.Sprintf("%s?name=%s&type=%d", dohURL, hostname, recordType)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Accept", "application/dns-json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("DoH returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var dohResp DoHResponse
+	if err := json.Unmarshal(body, &dohResp); err != nil {
+		return nil, err
+	}
+
+	if dohResp.Status != 0 {
+		return nil, fmt.Errorf("DNS query failed with status %d", dohResp.Status)
+	}
+
+	var ips []net.IP
+	for _, answer := range dohResp.Answer {
+		if answer.Type == recordType {
+			ip := net.ParseIP(answer.Data)
+			if ip != nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+
+	return ips, nil
+}
+
+// fetchECHConfig fetches ECH configuration via DoH
+func fetchECHConfig(hostname string) ([]byte, error) {
+	// Check cache
+	echConfigMu.Lock()
+	if echFetched {
+		cfg := echConfig
+		echConfigMu.Unlock()
+		if len(cfg) > 0 {
+			debugf("ECH: Using cached config (%d bytes)", len(cfg))
+		}
+		return cfg, nil
+	}
+	echConfigMu.Unlock()
+
+	dohProviders := []string{
+		"https://cloudflare-dns.com/dns-query",
+	}
+
+	echHostname := hostname
+	if hostname == "speed.cloudflare.com" {
+		echHostname = "cloudflare-ech.com"
+		debugf("ECH: Using cloudflare-ech.com for %s", hostname)
+	}
+
+	// Fetch ECH config from DoH providers
+	var lastErr error
+	for _, provider := range dohProviders {
+		debugf("ECH: Trying DoH provider %s for %s", provider, echHostname)
+		cfg, err := fetchECHFromDoH(provider, echHostname)
+		if err == nil && len(cfg) > 0 {
+			debugf("ECH: Successfully fetched config from %s (%d bytes)", provider, len(cfg))
+			echConfigMu.Lock()
+			echConfig = cfg
+			echFetched = true
+			echConfigMu.Unlock()
+			return cfg, nil
+		}
+		debugf("ECH: Failed to fetch from %s: %v", provider, err)
+		lastErr = err
+	}
+
+	// Mark as fetched
+	echConfigMu.Lock()
+	echFetched = true
+	echConfigMu.Unlock()
+
+	return nil, fmt.Errorf("all DoH providers failed, last error: %v", lastErr)
+}
+
+// fetchECHFromDoH queries DoH provider for ECH configuration
+func fetchECHFromDoH(dohURL, hostname string) ([]byte, error) {
+	url := fmt.Sprintf("%s?name=%s&type=65", dohURL, hostname)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/dns-json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("DoH request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("DoH returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	var dohResp DoHResponse
+	if err := json.Unmarshal(body, &dohResp); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+
+	if dohResp.Status != 0 {
+		return nil, fmt.Errorf("DNS query failed with status %d", dohResp.Status)
+	}
+
+	if len(dohResp.Answer) == 0 {
+		return nil, fmt.Errorf("no HTTPS records found")
+	}
+
+	// Parse ECH from HTTPS record
+	for _, answer := range dohResp.Answer {
+		if answer.Type == 65 { // HTTPS record
+			return parseECHFromHTTPSRecord(answer.Data)
+		}
+	}
+
+	return nil, fmt.Errorf("no ECH config in HTTPS records")
+}
+
+// parseECHFromHTTPSRecord extracts ECH config from HTTPS record data
+func parseECHFromHTTPSRecord(data string) ([]byte, error) {
+	// DoH providers return HTTPS records in different formats:
+	// 1. RFC 3597 format: "\\# <length> <hexdata>" (Cloudflare, Google)
+	// 2. Text format: "priority target [ech=<base64>]" (some providers)
+
+	// Handle RFC 3597 hex format
+	if strings.HasPrefix(data, "\\#") || strings.HasPrefix(data, "\\\\#") {
+		// Format: "\\# <length> <hexdata>"
+		data = strings.TrimPrefix(data, "\\\\")
+		data = strings.TrimPrefix(data, "\\")
+		parts := strings.Fields(data)
+		if len(parts) >= 3 && parts[0] == "#" {
+			// Join hex bytes
+			hexStr := strings.Join(parts[2:], "")
+			hexBytes, err := hexDecode(hexStr)
+			if err != nil {
+				return nil, fmt.Errorf("decode hex: %w", err)
+			}
+			// Parse HTTPS record wire format to extract ECH
+			return parseHTTPSWireFormat(hexBytes)
+		}
+	}
+
+	// Handle text format: try to find ech= parameter
+	parts := strings.Fields(data)
+	for _, part := range parts {
+		if strings.HasPrefix(part, "ech=") {
+			echB64 := strings.TrimPrefix(part, "ech=")
+			echB64 = strings.Trim(echB64, "\"")
+			decoded, err := base64.StdEncoding.DecodeString(echB64)
+			if err == nil && len(decoded) > 0 {
+				return decoded, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no ECH parameter found in HTTPS record")
+}
+
+// hexDecode converts hex string to bytes
+func hexDecode(s string) ([]byte, error) {
+	s = strings.ReplaceAll(s, " ", "")
+	if len(s)%2 != 0 {
+		return nil, fmt.Errorf("odd length hex string")
+	}
+	result := make([]byte, len(s)/2)
+	for i := 0; i < len(s); i += 2 {
+		var b byte
+		_, err := fmt.Sscanf(s[i:i+2], "%02x", &b)
+		if err != nil {
+			return nil, err
+		}
+		result[i/2] = b
+	}
+	return result, nil
+}
+
+// parseHTTPSWireFormat parses HTTPS record wire format to extract ECH config
+func parseHTTPSWireFormat(data []byte) ([]byte, error) {
+	// HTTPS record format (RFC 9460):
+	// - 2 bytes: SvcPriority
+	// - variable: TargetName
+	// - variable: SvcParams (key-value pairs)
+	//   - ECH param key = 5
+
+	if len(data) < 3 {
+		return nil, fmt.Errorf("HTTPS record too short")
+	}
+
+	// Skip priority (2 bytes)
+	offset := 2
+
+	// Parse target name (DNS name format)
+	for offset < len(data) {
+		labelLen := int(data[offset])
+		offset++
+		if labelLen == 0 {
+			break // End of name
+		}
+		if offset+labelLen > len(data) {
+			return nil, fmt.Errorf("invalid target name")
+		}
+		offset += labelLen
+	}
+
+	// Parse SvcParams
+	for offset < len(data) {
+		if offset+4 > len(data) {
+			break
+		}
+
+		// Read key (2 bytes)
+		key := uint16(data[offset])<<8 | uint16(data[offset+1])
+		offset += 2
+
+		// Read value length (2 bytes)
+		valueLen := int(data[offset])<<8 | int(data[offset+1])
+		offset += 2
+
+		if offset+valueLen > len(data) {
+			return nil, fmt.Errorf("invalid SvcParam value length")
+		}
+
+		// Check if this is ECH param (key = 5)
+		if key == 5 {
+			echConfig := make([]byte, valueLen)
+			copy(echConfig, data[offset:offset+valueLen])
+			debugf("ECH: Found ECH config in HTTPS record (key=5, %d bytes)", valueLen)
+			return echConfig, nil
+		}
+
+		offset += valueLen
+	}
+
+	return nil, fmt.Errorf("no ECH param (key=5) found in HTTPS record")
+}
+
+// tlsVersionName returns the name of the TLS version
+func tlsVersionName(version uint16) string {
+	switch version {
+	case tls.VersionTLS10:
+		return "1.0"
+	case tls.VersionTLS11:
+		return "1.1"
+	case tls.VersionTLS12:
+		return "1.2"
+	case tls.VersionTLS13:
+		return "1.3"
+	default:
+		return fmt.Sprintf("0x%04x", version)
+	}
+}
+
 func createHTTPClient() *http.Client {
-	// Create interface-bound dialer (handles interface binding if specified)
-	// Interface validation is already done in main(), so this should not fail for interface issues
 	dialer, err := createInterfaceBoundDialer()
 	if err != nil {
-		// This should be rare now that interface validation happens early
 		logger.Printf("Unexpected interface binding error: %v", err)
 		fmt.Fprintf(os.Stderr, "Error: Failed to bind to interface: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Apply IP version restrictions even without interface binding
 	if config.Interface == "" && (config.IPv4Only || config.IPv6Only) {
 		debugf("Applying IP version restriction: IPv4Only=%v, IPv6Only=%v", config.IPv4Only, config.IPv6Only)
 	}
 
 	if config.Interface != "" {
 		debugf("Interface binding: using interface %s with OS-specific binding (%s)", config.Interface, runtime.GOOS)
-
-		// Test if the interface can reach the internet
 		testReachability(dialer)
 	}
 
@@ -737,27 +1109,22 @@ func createHTTPClient() *http.Client {
 		DisableKeepAlives:   false,
 	}
 
-	// Set up dialer with interface binding
 	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if config.IPv4Only || config.IPv6Only {
-			// Forced IP version - use strict validation
 			return forcedIPVersionDialContext(ctx, dialer, network, addr)
 		} else {
-			// No IP version specified - use Happy Eyeballs
 			return happyEyeballsDialContext(ctx, dialer, network, addr)
 		}
 	}
 
 	transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		// Establish raw connection based on IP version preference
+		// Establish raw connection
 		var raw net.Conn
 		var err error
 
 		if config.IPv4Only || config.IPv6Only {
-			// Forced IP version - use strict validation
 			raw, err = forcedIPVersionDialContext(ctx, dialer, network, addr)
 		} else {
-			// No IP version specified - use Happy Eyeballs
 			raw, err = happyEyeballsDialContext(ctx, dialer, network, addr)
 		}
 
@@ -765,9 +1132,19 @@ func createHTTPClient() *http.Client {
 			return nil, err
 		}
 
-		// Perform TLS handshake
+		// Perform TLS handshake with ECH
 		tlsConfig := &tls.Config{
 			ServerName: "speed.cloudflare.com",
+			MinVersion: tls.VersionTLS13,
+		}
+
+		// Fetch and enable ECH configuration if available
+		echConfig, echErr := fetchECHConfig("speed.cloudflare.com")
+		if echErr == nil && len(echConfig) > 0 {
+			tlsConfig.EncryptedClientHelloConfigList = echConfig
+			debugf("ECH: Enabled with config (%d bytes)", len(echConfig))
+		} else {
+			debugf("ECH: Not available, using standard TLS 1.3 (%v)", echErr)
 		}
 
 		conn := tls.Client(raw, tlsConfig)
@@ -776,13 +1153,26 @@ func createHTTPClient() *http.Client {
 			return nil, fmt.Errorf("TLS handshake failed: %v", err)
 		}
 
-		debugf("TLS handshake successful")
+		// Check ECH status
+		state := conn.ConnectionState()
+		if len(echConfig) > 0 {
+			if state.ECHAccepted {
+				debugf("ECH: Status = ACCEPTED ✓")
+				stats.mu.Lock()
+				stats.ECHAccepted = true
+				stats.mu.Unlock()
+			} else {
+				debugf("ECH: Status = REJECTED")
+			}
+		}
+
+		debugf("TLS handshake successful (TLS %s)", tlsVersionName(state.Version))
 		return conn, nil
 	}
 
 	return &http.Client{
 		Transport: transport,
-		Timeout:   5 * time.Second,
+		Timeout:   30 * time.Second,
 	}
 }
 
@@ -810,7 +1200,6 @@ func performDownloadTest() {
 		cancel() // Signal display routine to stop
 	}
 
-	// Wait for display routine to finish cleaning up
 	displayWg.Wait()
 
 	printFinalStats()
@@ -819,36 +1208,32 @@ func performDownloadTest() {
 func downloadWorker(workerID int) {
 	client := createHTTPClient()
 
-	// Calculate download size from config.Size (in GiB)
-	downloadSize := int64(config.Size * 1024 * 1024 * 1024) // Convert GiB to bytes
+	downloadSize := int64(config.Size * 1024 * 1024 * 1024)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			// Use the configured size for each download request
 			url := fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", downloadSize)
 
 			resp, err := client.Get(url)
 			if err != nil {
 				logger.Printf("Worker %d: Download error: %v", workerID, err)
-				time.Sleep(100 * time.Millisecond) // Fast retry
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 
-			// Create a custom writer that updates stats as data flows
 			writer := &statsWriter{}
 			bytes, err := io.Copy(writer, resp.Body)
 			resp.Body.Close()
 
 			if err != nil {
 				logger.Printf("Worker %d: Read error: %v", workerID, err)
-				time.Sleep(100 * time.Millisecond) // Fast retry
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 
-			// Ensure we account for any remaining bytes
 			if bytes > writer.written {
 				stats.AddBytes(bytes - writer.written)
 			}
@@ -892,7 +1277,6 @@ func performUploadTest() {
 		cancel() // Signal display routine to stop
 	}
 
-	// Wait for display routine to finish cleaning up
 	displayWg.Wait()
 
 	printFinalStats()
@@ -901,18 +1285,15 @@ func performUploadTest() {
 func uploadWorker(workerID int) {
 	client := createHTTPClient()
 
-	// Calculate upload size from config.Size (in GiB)
-	uploadSize := int64(config.Size * 1024 * 1024 * 1024) // Convert GiB to bytes
+	uploadSize := int64(config.Size * 1024 * 1024 * 1024)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			// Use the configured size for each upload request
 			data := make([]byte, uploadSize)
 
-			// Create a tracking reader that updates stats as data is uploaded
 			reader := &statsReader{
 				reader: bytes.NewReader(data),
 				size:   uploadSize,
@@ -921,7 +1302,7 @@ func uploadWorker(workerID int) {
 			resp, err := client.Post("https://speed.cloudflare.com/__up", "application/octet-stream", reader)
 			if err != nil {
 				logger.Printf("Worker %d: Upload error: %v", workerID, err)
-				time.Sleep(100 * time.Millisecond) // Fast retry
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 
@@ -931,7 +1312,7 @@ func uploadWorker(workerID int) {
 	}
 }
 
-// Custom reader that updates stats as data is read (uploaded)
+// Custom reader that updates stats during upload
 type statsReader struct {
 	reader io.Reader
 	size   int64
@@ -956,13 +1337,11 @@ func displayProgress() {
 	for {
 		select {
 		case <-ctx.Done():
-			// Clear the progress display when shutting down
 			if !firstOutput {
 				fmt.Print("\r\033[K\033[1A\033[K\033[1A\033[K\033[1A\033[K")
 			}
 			return
 		case <-ticker.C:
-			// Update speed calculation based on total throughput from all workers
 			stats.UpdateCurrentSpeed()
 
 			currentSpeed := stats.GetCurrentSpeed()
@@ -970,7 +1349,6 @@ func displayProgress() {
 			elapsed := time.Since(stats.StartTime)
 
 			if !firstOutput {
-				// Move cursor up 3 lines (3 data lines without empty line) and clear from cursor to end
 				fmt.Print("\033[3A\033[J")
 			}
 			firstOutput = false
@@ -979,7 +1357,6 @@ func displayProgress() {
 			fmt.Printf("Elapsed Time: %s\n", formatDuration(elapsed))
 			fmt.Printf("Data Used: %s\n", formatBytes(totalBytes))
 
-			// Debug: Log to error file for troubleshooting
 			if totalBytes > 0 {
 				debugf("Total bytes: %d, Speed: %.2f B/s", totalBytes, currentSpeed)
 			}
@@ -989,7 +1366,6 @@ func displayProgress() {
 
 func formatSpeed(bytesPerSec float64) string {
 	units := []string{"bps", "Kbps", "Mbps", "Gbps"}
-	// Convert bytes to bits
 	bitsPerSec := bytesPerSec * 8
 	size := bitsPerSec
 	unitIndex := 0
@@ -1044,12 +1420,15 @@ func formatDuration(d time.Duration) string {
 }
 
 func printFinalStats() {
-	// Clear current line and move to beginning, then clear everything below
 	fmt.Print("\r\033[K\033[J")
 
 	totalDuration := stats.EndTime.Sub(stats.StartTime)
 	totalBytes := stats.GetTotalBytes()
 	averageSpeed := float64(totalBytes) / totalDuration.Seconds()
+
+	stats.mu.RLock()
+	echStatus := stats.ECHAccepted
+	stats.mu.RUnlock()
 
 	fmt.Printf("Test Start Time: %s\n", stats.StartTime.Format("2006-01-02 15:04:05"))
 	fmt.Printf("Test End Time: %s\n", stats.EndTime.Format("2006-01-02 15:04:05"))
@@ -1057,4 +1436,5 @@ func printFinalStats() {
 	fmt.Printf("Total Data Used: %s\n", formatBytes(totalBytes))
 	fmt.Printf("Average Speed: %s\n", formatSpeed(averageSpeed))
 	fmt.Printf("Maximum Speed: %s\n", formatSpeed(stats.GetMaxSpeed()))
+	fmt.Printf("ECH: %v\n", echStatus)
 }
