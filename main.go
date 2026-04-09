@@ -23,6 +23,9 @@ import (
 	"unsafe"
 )
 
+// buildVersion is set at link time by build.sh (-ldflags -X main.buildVersion=...).
+var buildVersion string
+
 type Config struct {
 	Help      bool
 	Down      bool
@@ -102,15 +105,35 @@ func (s *Stats) GetTotalBytes() int64 {
 }
 
 var (
-	config      Config
-	stats       Stats
-	logger      *log.Logger
-	cancel      context.CancelFunc
-	ctx         context.Context
-	echConfig   []byte      // Cached ECH configuration
-	echConfigMu sync.Mutex  // Protects echConfig
-	echFetched  bool        // Whether ECH config has been fetched
+	config         Config
+	stats          Stats
+	logger         *log.Logger
+	cancel         context.CancelFunc
+	ctx            context.Context
+	echConfig      []byte     // Cached ECH configuration
+	echConfigMu    sync.Mutex // Protects echConfig
+	echFetched     bool       // Whether ECH config has been fetched
+	payloadCapWarn sync.Once
 )
+
+// cloudflareMaxPayloadBytes is the largest single-request download/upload payload accepted by
+// speed.cloudflare.com (HTTP 403 for __down?bytes>=100_000_000 as of 2026).
+const cloudflareMaxPayloadBytes int64 = 100_000_000 - 1
+
+// cloudflareReferer matches the browser speed test page origin (same-origin requests).
+const cloudflareReferer = "https://speed.cloudflare.com/"
+
+// refererRoundTripper sets Referer on each request (RoundTrip must not mutate the original Request).
+type refererRoundTripper struct {
+	t       http.RoundTripper
+	referer string
+}
+
+func (rt *refererRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	r := req.Clone(req.Context())
+	r.Header.Set("Referer", rt.referer)
+	return rt.t.RoundTrip(r)
+}
 
 func init() {
 	flag.BoolVar(&config.Help, "h", false, "Show help")
@@ -121,8 +144,8 @@ func init() {
 	flag.BoolVar(&config.Up, "up", false, "Perform upload speed test")
 	flag.IntVar(&config.TestTime, "t", 0, "Test duration in seconds (0 for continuous)")
 	flag.IntVar(&config.TestTime, "time", 0, "Test duration in seconds (0 for continuous)")
-	flag.Float64Var(&config.Size, "s", 0.1, "Test size in GiB")
-	flag.Float64Var(&config.Size, "size", 0.1, "Test size in GiB")
+	flag.Float64Var(&config.Size, "s", 0.1, "Test size in GiB (per-request payload capped by Cloudflare)")
+	flag.Float64Var(&config.Size, "size", 0.1, "Test size in GiB (per-request payload capped by Cloudflare)")
 	flag.IntVar(&config.Parallel, "P", 4, "Number of parallel connections")
 	flag.IntVar(&config.Parallel, "parallel", 4, "Number of parallel connections")
 	flag.StringVar(&config.Interface, "I", "", "Network interface to use")
@@ -268,13 +291,16 @@ func main() {
 
 func showHelp() {
 	fmt.Println("Speed Test Tool")
+	if buildVersion != "" {
+		fmt.Printf("Version: %s\n", buildVersion)
+	}
 	fmt.Println("")
 	fmt.Println("Usage:")
 	fmt.Println("  -h, --help       Show this help message")
 	fmt.Println("  -d, --down       Perform download speed test (mutually exclusive with -u)")
 	fmt.Println("  -u, --up         Perform upload speed test (mutually exclusive with -d)")
 	fmt.Println("  -t, --time       Test duration in seconds (default: continuous)")
-	fmt.Println("  -s, --size       Test size in GiB (default: 0.1)")
+	fmt.Println("  -s, --size       Test size in GiB (default: 0.1; max ~95.37 MiB per request on CF)")
 	fmt.Println("  -P, --parallel   Number of parallel connections (default: 4)")
 	fmt.Println("  -I, --interface  Network interface to use")
 	fmt.Println("  --fwmark         Firewall mark")
@@ -1171,9 +1197,25 @@ func createHTTPClient() *http.Client {
 	}
 
 	return &http.Client{
-		Transport: transport,
+		Transport: &refererRoundTripper{t: transport, referer: cloudflareReferer},
 		Timeout:   30 * time.Second,
 	}
+}
+
+// cloudflareCappedPayloadBytes returns config.Size as bytes, capped for Cloudflare's per-request limit.
+func cloudflareCappedPayloadBytes() int64 {
+	b := int64(config.Size * 1024 * 1024 * 1024)
+	if b < 1 {
+		b = 1
+	}
+	if b > cloudflareMaxPayloadBytes {
+		orig := b
+		b = cloudflareMaxPayloadBytes
+		payloadCapWarn.Do(func() {
+			debugf("Capping per-request payload from %d to %d bytes (Cloudflare limit)", orig, cloudflareMaxPayloadBytes)
+		})
+	}
+	return b
 }
 
 func performDownloadTest() {
@@ -1208,7 +1250,7 @@ func performDownloadTest() {
 func downloadWorker(workerID int) {
 	client := createHTTPClient()
 
-	downloadSize := int64(config.Size * 1024 * 1024 * 1024)
+	downloadSize := cloudflareCappedPayloadBytes()
 
 	for {
 		select {
@@ -1285,7 +1327,7 @@ func performUploadTest() {
 func uploadWorker(workerID int) {
 	client := createHTTPClient()
 
-	uploadSize := int64(config.Size * 1024 * 1024 * 1024)
+	uploadSize := cloudflareCappedPayloadBytes()
 
 	for {
 		select {
