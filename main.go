@@ -829,14 +829,16 @@ func resolveHostnameViaDoH(hostname string) ([]net.IP, error) {
 	return allIPs, nil
 }
 
+// dohClient is a shared HTTP client for all DNS-over-HTTPS queries,
+// enabling HTTP/2 connection reuse across DoH requests.
+var dohClient = &http.Client{Timeout: 5 * time.Second}
+
 // queryDoHRecord queries a specific DNS record type via DoH
 func queryDoHRecord(hostname string, recordType int) ([]net.IP, error) {
 	dohURL := "https://cloudflare-dns.com/dns-query"
 	url := fmt.Sprintf("%s?name=%s&type=%d", dohURL, hostname, recordType)
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-	}
+	client := dohClient
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -935,9 +937,7 @@ func fetchECHConfig(hostname string) ([]byte, error) {
 func fetchECHFromDoH(dohURL, hostname string) ([]byte, error) {
 	url := fmt.Sprintf("%s?name=%s&type=65", dohURL, hostname)
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-	}
+	client := dohClient
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
