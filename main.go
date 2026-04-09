@@ -311,7 +311,7 @@ func showHelp() {
 
 func setupLogger() {
 	// Clear the log file if it exists, or create it if it doesn't
-	logFile, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	logFile, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening log file: %v\n", err)
 		os.Exit(1)
