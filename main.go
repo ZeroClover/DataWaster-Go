@@ -1211,7 +1211,6 @@ func createHTTPClient() *http.Client {
 
 	return &http.Client{
 		Transport: &refererRoundTripper{t: transport, referer: cloudflareReferer},
-		Timeout:   30 * time.Second,
 	}
 }
 
@@ -1272,8 +1271,17 @@ func downloadWorker(workerID int) {
 		default:
 			url := fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", downloadSize)
 
-			resp, err := client.Get(url)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 			if err != nil {
+				logger.Printf("Worker %d: Request creation error: %v", workerID, err)
+				return
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				logger.Printf("Worker %d: Download error: %v", workerID, err)
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -1292,6 +1300,9 @@ func downloadWorker(workerID int) {
 			resp.Body.Close()
 
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				logger.Printf("Worker %d: Read error: %v", workerID, err)
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -1360,8 +1371,18 @@ func uploadWorker(workerID int) {
 				size:   uploadSize,
 			}
 
-			resp, err := client.Post("https://speed.cloudflare.com/__up", "application/octet-stream", reader)
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://speed.cloudflare.com/__up", reader)
 			if err != nil {
+				logger.Printf("Worker %d: Request creation error: %v", workerID, err)
+				return
+			}
+			req.Header.Set("Content-Type", "application/octet-stream")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				logger.Printf("Worker %d: Upload error: %v", workerID, err)
 				time.Sleep(100 * time.Millisecond)
 				continue
