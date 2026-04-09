@@ -1324,6 +1324,8 @@ func cloudflareCappedPayloadBytes() int64 {
 }
 
 func performDownloadTest() {
+	client := createHTTPClient()
+
 	var wg sync.WaitGroup
 	var displayWg sync.WaitGroup
 
@@ -1337,7 +1339,7 @@ func performDownloadTest() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			downloadWorker(workerID)
+			downloadWorker(workerID, client)
 		}(i)
 	}
 
@@ -1352,9 +1354,7 @@ func performDownloadTest() {
 	printFinalStats()
 }
 
-func downloadWorker(workerID int) {
-	client := createHTTPClient()
-
+func downloadWorker(workerID int, client *http.Client) {
 	downloadSize := cloudflareCappedPayloadBytes()
 
 	for {
@@ -1421,6 +1421,8 @@ func (w *statsWriter) Write(p []byte) (n int, err error) {
 }
 
 func performUploadTest() {
+	client := createHTTPClient()
+
 	var wg sync.WaitGroup
 	var displayWg sync.WaitGroup
 
@@ -1434,7 +1436,7 @@ func performUploadTest() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			uploadWorker(workerID)
+			uploadWorker(workerID, client)
 		}(i)
 	}
 
@@ -1449,9 +1451,7 @@ func performUploadTest() {
 	printFinalStats()
 }
 
-func uploadWorker(workerID int) {
-	client := createHTTPClient()
-
+func uploadWorker(workerID int, client *http.Client) {
 	uploadSize := cloudflareCappedPayloadBytes()
 
 	for {
