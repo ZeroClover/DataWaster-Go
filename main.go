@@ -1147,6 +1147,9 @@ func tlsVersionName(version uint16) string {
 	}
 }
 
+// reachabilityOnce ensures the interface reachability probe runs at most once.
+var reachabilityOnce sync.Once
+
 func createHTTPClient() *http.Client {
 	dialer, err := createInterfaceBoundDialer()
 	if err != nil {
@@ -1161,7 +1164,7 @@ func createHTTPClient() *http.Client {
 
 	if config.Interface != "" {
 		debugf("Interface binding: using interface %s with OS-specific binding (%s)", config.Interface, runtime.GOOS)
-		testReachability(dialer)
+		reachabilityOnce.Do(func() { testReachability(dialer) })
 	}
 
 	transport := &http.Transport{
