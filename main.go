@@ -1265,6 +1265,14 @@ func downloadWorker(workerID int) {
 				continue
 			}
 
+			if resp.StatusCode != http.StatusOK {
+				logger.Printf("Worker %d: Download HTTP %d", workerID, resp.StatusCode)
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
 			writer := &statsWriter{}
 			bytes, err := io.Copy(writer, resp.Body)
 			resp.Body.Close()
@@ -1345,6 +1353,9 @@ func uploadWorker(workerID int) {
 				continue
 			}
 
+			if resp.StatusCode != http.StatusOK {
+				logger.Printf("Worker %d: Upload HTTP %d", workerID, resp.StatusCode)
+			}
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
