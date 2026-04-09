@@ -267,19 +267,21 @@ func main() {
 		}
 	}
 
-	stats.StartTime = time.Now()
-	stats.LastTime = time.Now()
-
-	// Pre-fetch ECH configuration
+	// Pre-fetch ECH configuration before starting the timer
 	debugf("Pre-fetching ECH configuration before starting test...")
 	_, _ = fetchECHConfig("speed.cloudflare.com")
 
-	// Pre-resolve IP addresses using DoH
+	// Pre-resolve IP addresses using DoH before starting the timer
 	debugf("Pre-resolving IP addresses via DoH before starting test...")
 	_, err := resolveHostnameViaDoH("speed.cloudflare.com")
 	if err != nil {
 		logger.Printf("Warning: Failed to resolve IPs via DoH: %v (will use system DNS as fallback)", err)
 	}
+
+	// Start the clock only after warmup is complete
+	stats.StartTime = time.Now()
+	stats.LastTime = time.Now()
+	startTestTimer()
 
 	if config.Down {
 		performDownloadTest()
@@ -339,7 +341,11 @@ func setupSignalHandler() {
 
 		time.Sleep(100 * time.Millisecond)
 	}()
+}
 
+// startTestTimer starts the test duration countdown. Must be called after
+// warmup (ECH/DoH) so that pre-resolution time is not counted.
+func startTestTimer() {
 	if config.TestTime > 0 {
 		go func() {
 			time.Sleep(time.Duration(config.TestTime) * time.Second)
