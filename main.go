@@ -385,16 +385,16 @@ func happyEyeballsDialContext(ctx context.Context, dialer *net.Dialer, network, 
 	// Use DoH-resolved IPs if cached
 	var ips []net.IPAddr
 	resolvedIPsMu.RLock()
-	cachedIPs, hasCached := resolvedIPs[host]
+	cachedEntry, hasCached := resolvedIPs[host]
 	resolvedIPsMu.RUnlock()
 
-	if hasCached {
+	if hasCached && time.Now().Before(cachedEntry.expiry) {
 		debugf("Happy Eyeballs: Using DoH-resolved IPs for %s", host)
-		for _, ip := range cachedIPs {
+		for _, ip := range cachedEntry.ips {
 			ips = append(ips, net.IPAddr{IP: ip})
 		}
 	} else {
-		debugf("Happy Eyeballs: Using system DNS for %s (DoH cache miss)", host)
+		debugf("Happy Eyeballs: Using system DNS for %s (DoH cache miss/expired)", host)
 		var lookupErr error
 		ips, lookupErr = net.DefaultResolver.LookupIPAddr(ctx, host)
 		if lookupErr != nil {
@@ -518,16 +518,16 @@ func forcedIPVersionDialContext(ctx context.Context, dialer *net.Dialer, network
 	// Use DoH-resolved IPs if cached
 	var ips []net.IPAddr
 	resolvedIPsMu.RLock()
-	cachedIPs, hasCached := resolvedIPs[host]
+	cachedEntry, hasCached := resolvedIPs[host]
 	resolvedIPsMu.RUnlock()
 
-	if hasCached {
+	if hasCached && time.Now().Before(cachedEntry.expiry) {
 		debugf("Forced IP version: Using DoH-resolved IPs for %s", host)
-		for _, ip := range cachedIPs {
+		for _, ip := range cachedEntry.ips {
 			ips = append(ips, net.IPAddr{IP: ip})
 		}
 	} else {
-		debugf("Forced IP version: Using system DNS for %s (DoH cache miss)", host)
+		debugf("Forced IP version: Using system DNS for %s (DoH cache miss/expired)", host)
 		var lookupErr error
 		ips, lookupErr = net.DefaultResolver.LookupIPAddr(ctx, host)
 		if lookupErr != nil {
@@ -780,44 +780,58 @@ type DoHResponse struct {
 	} `json:"Answer"`
 }
 
+// dohCacheEntry holds cached DNS results with an expiry derived from the response TTL.
+type dohCacheEntry struct {
+	ips    []net.IP
+	expiry time.Time
+}
+
 // resolvedIPs stores resolved IP addresses to avoid repeated DNS queries
 var (
 	resolvedIPsMu sync.RWMutex
-	resolvedIPs   = make(map[string][]net.IP)
+	resolvedIPs   = make(map[string]dohCacheEntry)
 )
 
 // resolveHostnameViaDoH resolves hostname using DNS-over-HTTPS
 func resolveHostnameViaDoH(hostname string) ([]net.IP, error) {
-	// Check cache
+	// Check cache (honour TTL)
 	resolvedIPsMu.RLock()
-	if ips, ok := resolvedIPs[hostname]; ok {
+	if entry, ok := resolvedIPs[hostname]; ok && time.Now().Before(entry.expiry) {
 		resolvedIPsMu.RUnlock()
-		debugf("DoH DNS: Using cached IPs for %s (%d addresses)", hostname, len(ips))
-		return ips, nil
+		debugf("DoH DNS: Using cached IPs for %s (%d addresses, expires in %s)",
+			hostname, len(entry.ips), time.Until(entry.expiry).Truncate(time.Second))
+		return entry.ips, nil
 	}
 	resolvedIPsMu.RUnlock()
 
 	debugf("DoH DNS: Resolving %s via DNS-over-HTTPS", hostname)
 
 	var allIPs []net.IP
+	minTTL := 300 // default 5 min if no TTL found
 
 	// Query A record (IPv4)
-	ipv4s, err := queryDoHRecord(hostname, 1)
+	ipv4s, ttl4, err := queryDoHRecord(hostname, 1)
 	if err == nil {
 		for _, ip := range ipv4s {
 			debugf("DoH DNS: Resolved %s -> %s (IPv4)", hostname, ip)
 			allIPs = append(allIPs, ip)
+		}
+		if ttl4 > 0 && ttl4 < minTTL {
+			minTTL = ttl4
 		}
 	} else {
 		debugf("DoH DNS: Failed to resolve A record for %s: %v", hostname, err)
 	}
 
 	// Query AAAA record (IPv6)
-	ipv6s, err := queryDoHRecord(hostname, 28)
+	ipv6s, ttl6, err := queryDoHRecord(hostname, 28)
 	if err == nil {
 		for _, ip := range ipv6s {
 			debugf("DoH DNS: Resolved %s -> %s (IPv6)", hostname, ip)
 			allIPs = append(allIPs, ip)
+		}
+		if ttl6 > 0 && ttl6 < minTTL {
+			minTTL = ttl6
 		}
 	} else {
 		debugf("DoH DNS: Failed to resolve AAAA record for %s: %v", hostname, err)
@@ -827,11 +841,15 @@ func resolveHostnameViaDoH(hostname string) ([]net.IP, error) {
 		return nil, fmt.Errorf("no IP addresses found for %s", hostname)
 	}
 
-	// Cache results
+	// Cache results with TTL
 	resolvedIPsMu.Lock()
-	resolvedIPs[hostname] = allIPs
+	resolvedIPs[hostname] = dohCacheEntry{
+		ips:    allIPs,
+		expiry: time.Now().Add(time.Duration(minTTL) * time.Second),
+	}
 	resolvedIPsMu.Unlock()
 
+	debugf("DoH DNS: Cached %d IPs for %s (TTL %ds)", len(allIPs), hostname, minTTL)
 	return allIPs, nil
 }
 
@@ -839,8 +857,9 @@ func resolveHostnameViaDoH(hostname string) ([]net.IP, error) {
 // enabling HTTP/2 connection reuse across DoH requests.
 var dohClient = &http.Client{Timeout: 5 * time.Second}
 
-// queryDoHRecord queries a specific DNS record type via DoH
-func queryDoHRecord(hostname string, recordType int) ([]net.IP, error) {
+// queryDoHRecord queries a specific DNS record type via DoH.
+// Returns the resolved IPs, the minimum TTL (seconds) across answers, and any error.
+func queryDoHRecord(hostname string, recordType int) ([]net.IP, int, error) {
 	dohURL := "https://cloudflare-dns.com/dns-query"
 	url := fmt.Sprintf("%s?name=%s&type=%d", dohURL, hostname, recordType)
 
@@ -848,46 +867,50 @@ func queryDoHRecord(hostname string, recordType int) ([]net.IP, error) {
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	req.Header.Set("Accept", "application/dns-json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("DoH returned status %d", resp.StatusCode)
+		return nil, 0, fmt.Errorf("DoH returned status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var dohResp DoHResponse
 	if err := json.Unmarshal(body, &dohResp); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	if dohResp.Status != 0 {
-		return nil, fmt.Errorf("DNS query failed with status %d", dohResp.Status)
+		return nil, 0, fmt.Errorf("DNS query failed with status %d", dohResp.Status)
 	}
 
 	var ips []net.IP
+	minTTL := 0
 	for _, answer := range dohResp.Answer {
 		if answer.Type == recordType {
 			ip := net.ParseIP(answer.Data)
 			if ip != nil {
 				ips = append(ips, ip)
+				if minTTL == 0 || answer.TTL < minTTL {
+					minTTL = answer.TTL
+				}
 			}
 		}
 	}
 
-	return ips, nil
+	return ips, minTTL, nil
 }
 
 // fetchECHConfig fetches ECH configuration via DoH
