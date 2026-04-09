@@ -415,25 +415,46 @@ func happyEyeballsDialContext(ctx context.Context, dialer *net.Dialer, network, 
 		len(ipv4Addrs), len(ipv6Addrs), host)
 
 	if len(ipv6Addrs) == 0 && len(ipv4Addrs) > 0 {
-		debugf("Happy Eyeballs: using IPv4 only")
-		return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(ipv4Addrs[0].String(), port))
+		debugf("Happy Eyeballs: using IPv4 only (%d addresses)", len(ipv4Addrs))
+		return dialFirstSuccessful(ctx, dialer, "tcp4", ipv4Addrs, port)
 	}
 	if len(ipv4Addrs) == 0 && len(ipv6Addrs) > 0 {
-		debugf("Happy Eyeballs: using IPv6 only")
-		return dialer.DialContext(ctx, "tcp6", net.JoinHostPort(ipv6Addrs[0].String(), port))
+		debugf("Happy Eyeballs: using IPv6 only (%d addresses)", len(ipv6Addrs))
+		return dialFirstSuccessful(ctx, dialer, "tcp6", ipv6Addrs, port)
 	}
 
 	if len(ipv4Addrs) > 0 && len(ipv6Addrs) > 0 {
-		return raceConnections(ctx, dialer, ipv4Addrs[0], ipv6Addrs[0], port)
+		return raceConnections(ctx, dialer, ipv4Addrs, ipv6Addrs, port)
 	}
 
 	return nil, fmt.Errorf("no usable addresses found for %s (IPv4 allowed: %v, IPv6 allowed: %v)",
 		host, canUseIPv4, canUseIPv6)
 }
 
-// raceConnections implements the Happy Eyeballs connection racing
-func raceConnections(ctx context.Context, dialer *net.Dialer, ipv4, ipv6 net.IP, port string) (net.Conn, error) {
-	debugf("Happy Eyeballs: racing IPv6 %s vs IPv4 %s", ipv6, ipv4)
+// dialFirstSuccessful tries each IP in order and returns the first successful connection.
+func dialFirstSuccessful(ctx context.Context, dialer *net.Dialer, network string, addrs []net.IP, port string) (net.Conn, error) {
+	var lastErr error
+	for _, ip := range addrs {
+		addr := net.JoinHostPort(ip.String(), port)
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		debugf("dialFirstSuccessful: %s failed: %v", addr, err)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, fmt.Errorf("all %d addresses failed, last error: %v", len(addrs), lastErr)
+}
+
+// raceConnections implements the Happy Eyeballs connection racing.
+// It tries the first IPv6 address, then falls back to IPv4 after 250ms or
+// immediate IPv6 failure. If neither first address works, it falls through
+// to dialFirstSuccessful on the remaining addresses.
+func raceConnections(ctx context.Context, dialer *net.Dialer, ipv4Addrs, ipv6Addrs []net.IP, port string) (net.Conn, error) {
+	debugf("Happy Eyeballs: racing IPv6 %s vs IPv4 %s", ipv6Addrs[0], ipv4Addrs[0])
 
 	type connResult struct {
 		conn net.Conn
@@ -446,9 +467,9 @@ func raceConnections(ctx context.Context, dialer *net.Dialer, ipv4, ipv6 net.IP,
 	// instead of waiting the full 250ms delay.
 	fallback := make(chan struct{})
 
-	// Start IPv6 connection
+	// Start IPv6 connection with first address
 	go func() {
-		addr := net.JoinHostPort(ipv6.String(), port)
+		addr := net.JoinHostPort(ipv6Addrs[0].String(), port)
 		conn, err := dialer.DialContext(ctx, "tcp6", addr)
 		if err != nil {
 			close(fallback)
@@ -467,7 +488,7 @@ func raceConnections(ctx context.Context, dialer *net.Dialer, ipv4, ipv6 net.IP,
 		case <-time.After(250 * time.Millisecond):
 		}
 
-		addr := net.JoinHostPort(ipv4.String(), port)
+		addr := net.JoinHostPort(ipv4Addrs[0].String(), port)
 		conn, err := dialer.DialContext(ctx, "tcp4", addr)
 		results <- connResult{conn: conn, err: err, ipv6: false}
 	}()
@@ -500,6 +521,24 @@ func raceConnections(ctx context.Context, dialer *net.Dialer, ipv4, ipv6 net.IP,
 			lastErr = result.err
 			debugf("Happy Eyeballs: connection failed: %v", result.err)
 		}
+	}
+
+	// Both first-choice addresses failed; try remaining addresses sequentially.
+	if len(ipv6Addrs) > 1 {
+		debugf("Happy Eyeballs: trying remaining %d IPv6 addresses", len(ipv6Addrs)-1)
+		conn, err := dialFirstSuccessful(ctx, dialer, "tcp6", ipv6Addrs[1:], port)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if len(ipv4Addrs) > 1 {
+		debugf("Happy Eyeballs: trying remaining %d IPv4 addresses", len(ipv4Addrs)-1)
+		conn, err := dialFirstSuccessful(ctx, dialer, "tcp4", ipv4Addrs[1:], port)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
 	}
 
 	return nil, fmt.Errorf("all connection attempts failed, last error: %v", lastErr)
@@ -535,40 +574,37 @@ func forcedIPVersionDialContext(ctx context.Context, dialer *net.Dialer, network
 		}
 	}
 
-	var targetIP net.IP
+	var targetAddrs []net.IP
 	var targetNetwork string
 
 	if config.IPv4Only {
 		for _, ip := range ips {
 			if ip.IP.To4() != nil {
-				targetIP = ip.IP
-				targetNetwork = "tcp4"
-				break
+				targetAddrs = append(targetAddrs, ip.IP)
 			}
 		}
-		if targetIP == nil {
+		targetNetwork = "tcp4"
+		if len(targetAddrs) == 0 {
 			logger.Printf("FATAL: IPv4-only mode requested but no IPv4 addresses found for %s", host)
 			return nil, fmt.Errorf("IPv4-only mode: no IPv4 addresses available for %s", host)
 		}
-		debugf("IPv4-only: using %s", targetIP)
+		debugf("IPv4-only: %d addresses for %s", len(targetAddrs), host)
 	} else if config.IPv6Only {
 		for _, ip := range ips {
 			if ip.IP.To4() == nil {
-				targetIP = ip.IP
-				targetNetwork = "tcp6"
-				break
+				targetAddrs = append(targetAddrs, ip.IP)
 			}
 		}
-		if targetIP == nil {
+		targetNetwork = "tcp6"
+		if len(targetAddrs) == 0 {
 			logger.Printf("FATAL: IPv6-only mode requested but no IPv6 addresses found for %s", host)
 			return nil, fmt.Errorf("IPv6-only mode: no IPv6 addresses available for %s", host)
 		}
-		debugf("IPv6-only: using %s", targetIP)
+		debugf("IPv6-only: %d addresses for %s", len(targetAddrs), host)
 	}
 
-	// Connect to specific IP
-	targetAddr := net.JoinHostPort(targetIP.String(), port)
-	return dialer.DialContext(ctx, targetNetwork, targetAddr)
+	// Try each address in order until one succeeds
+	return dialFirstSuccessful(ctx, dialer, targetNetwork, targetAddrs, port)
 }
 
 // macOS-specific constants and functions
