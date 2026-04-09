@@ -632,53 +632,71 @@ func bindToInterfaceDarwin(fd int, interfaceName string, isIPv6 bool) error {
 	return nil
 }
 
+// setFwMark applies SO_MARK to the socket (Linux only).
+func setFwMark(fd int, mark int) error {
+	const SO_MARK = 36 // Linux SO_MARK
+	return syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, SO_MARK, mark)
+}
+
 // createInterfaceBoundDialer creates a dialer bound to a specific interface
 func createInterfaceBoundDialer() (*net.Dialer, error) {
-	if config.Interface == "" {
+	if config.Interface == "" && config.FwMark == 0 {
 		return &net.Dialer{Timeout: 5 * time.Second}, nil
 	}
 
-	ief, err := net.InterfaceByName(config.Interface)
-	if err != nil {
-		return nil, fmt.Errorf("interface %s not found: %v", config.Interface, err)
-	}
+	var ief *net.Interface
+	if config.Interface != "" {
+		var err error
+		ief, err = net.InterfaceByName(config.Interface)
+		if err != nil {
+			return nil, fmt.Errorf("interface %s not found: %v", config.Interface, err)
+		}
 
-	debugf("Interface %s details: Index=%d, MTU=%d, HardwareAddr=%s, Flags=%s",
-		config.Interface, ief.Index, ief.MTU, ief.HardwareAddr, ief.Flags)
+		debugf("Interface %s details: Index=%d, MTU=%d, HardwareAddr=%s, Flags=%s",
+			config.Interface, ief.Index, ief.MTU, ief.HardwareAddr, ief.Flags)
 
-	addrs, err := ief.Addrs()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get addresses for interface %s: %v", config.Interface, err)
-	}
+		addrs, err := ief.Addrs()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get addresses for interface %s: %v", config.Interface, err)
+		}
 
-	debugf("Interface %s has %d addresses:", config.Interface, len(addrs))
-	for i, addr := range addrs {
-		debugf("  Address %d: %s", i, addr.String())
-	}
+		debugf("Interface %s has %d addresses:", config.Interface, len(addrs))
+		for i, addr := range addrs {
+			debugf("  Address %d: %s", i, addr.String())
+		}
 
-	// Check available IP versions
-	var hasIPv4, hasIPv6 bool
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				hasIPv4 = true
-				debugf("Found IPv4 address: %s", ipnet.IP.String())
-			} else if ipnet.IP.To16() != nil {
-				hasIPv6 = true
-				debugf("Found IPv6 address: %s", ipnet.IP.String())
+		// Check available IP versions
+		var hasIPv4, hasIPv6 bool
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ipnet.IP.To4() != nil {
+					hasIPv4 = true
+					debugf("Found IPv4 address: %s", ipnet.IP.String())
+				} else if ipnet.IP.To16() != nil {
+					hasIPv6 = true
+					debugf("Found IPv6 address: %s", ipnet.IP.String())
+				}
 			}
 		}
+
+		// Validate IP version availability
+		if config.IPv4Only && !hasIPv4 {
+			return nil, fmt.Errorf("IPv4-only mode requested but no IPv4 address found on interface %s", config.Interface)
+		}
+		if config.IPv6Only && !hasIPv6 {
+			return nil, fmt.Errorf("IPv6-only mode requested but no IPv6 address found on interface %s", config.Interface)
+		}
+
+		debugf("Using OS-specific interface binding for %s (OS: %s)", config.Interface, runtime.GOOS)
 	}
 
-	// Validate IP version availability
-	if config.IPv4Only && !hasIPv4 {
-		return nil, fmt.Errorf("IPv4-only mode requested but no IPv4 address found on interface %s", config.Interface)
+	if config.FwMark != 0 {
+		if runtime.GOOS != "linux" {
+			fmt.Fprintf(os.Stderr, "Warning: --fwmark is only supported on Linux, ignoring\n")
+		} else {
+			debugf("Firewall mark: will set SO_MARK=%d on sockets", config.FwMark)
+		}
 	}
-	if config.IPv6Only && !hasIPv6 {
-		return nil, fmt.Errorf("IPv6-only mode requested but no IPv6 address found on interface %s", config.Interface)
-	}
-
-	debugf("Using OS-specific interface binding for %s (OS: %s)", config.Interface, runtime.GOOS)
 
 	dialer := &net.Dialer{
 		Timeout: 5 * time.Second,
@@ -687,36 +705,49 @@ func createInterfaceBoundDialer() (*net.Dialer, error) {
 			fn := func(fd uintptr) {
 				intFd := int(fd)
 
-				switch runtime.GOOS {
-				case "linux":
-					if err := bindToInterfaceLinux(intFd, config.Interface); err != nil {
-						operr = fmt.Errorf("failed to bind to interface %s on Linux: %v", config.Interface, err)
-						logger.Printf("Linux interface binding failed: %v", operr)
-					} else {
-						debugf("Linux: Successfully bound socket to interface %s using SO_BINDTODEVICE", config.Interface)
-					}
-
-				case "darwin":
-					isIPv6 := network == "tcp6" || network == "udp6" || strings.HasSuffix(network, "6")
-					if err := bindToInterfaceDarwin(intFd, config.Interface, isIPv6); err != nil {
-						operr = fmt.Errorf("failed to bind to interface %s on macOS: %v", config.Interface, err)
-						logger.Printf("macOS interface binding failed for %s: %v", network, operr)
-					} else {
-						protocol := "IPv4"
-						if isIPv6 {
-							protocol = "IPv6"
+				// Apply interface binding if requested
+				if config.Interface != "" {
+					switch runtime.GOOS {
+					case "linux":
+						if err := bindToInterfaceLinux(intFd, config.Interface); err != nil {
+							operr = fmt.Errorf("failed to bind to interface %s on Linux: %v", config.Interface, err)
+							logger.Printf("Linux interface binding failed: %v", operr)
+						} else {
+							debugf("Linux: Successfully bound socket to interface %s using SO_BINDTODEVICE", config.Interface)
 						}
-						debugf("macOS: Successfully bound %s socket (%s) to interface %s (index %d)",
-							protocol, network, config.Interface, ief.Index)
-					}
 
-				default:
-					debugf("Warning: Unsupported OS %s, trying Linux-style binding", runtime.GOOS)
-					if err := bindToInterfaceLinux(intFd, config.Interface); err != nil {
-						operr = fmt.Errorf("failed to bind to interface %s on %s: %v", config.Interface, runtime.GOOS, err)
-						logger.Printf("Fallback interface binding failed: %v", operr)
+					case "darwin":
+						isIPv6 := network == "tcp6" || network == "udp6" || strings.HasSuffix(network, "6")
+						if err := bindToInterfaceDarwin(intFd, config.Interface, isIPv6); err != nil {
+							operr = fmt.Errorf("failed to bind to interface %s on macOS: %v", config.Interface, err)
+							logger.Printf("macOS interface binding failed for %s: %v", network, operr)
+						} else {
+							protocol := "IPv4"
+							if isIPv6 {
+								protocol = "IPv6"
+							}
+							debugf("macOS: Successfully bound %s socket (%s) to interface %s (index %d)",
+								protocol, network, config.Interface, ief.Index)
+						}
+
+					default:
+						debugf("Warning: Unsupported OS %s, trying Linux-style binding", runtime.GOOS)
+						if err := bindToInterfaceLinux(intFd, config.Interface); err != nil {
+							operr = fmt.Errorf("failed to bind to interface %s on %s: %v", config.Interface, runtime.GOOS, err)
+							logger.Printf("Fallback interface binding failed: %v", operr)
+						} else {
+							debugf("Fallback: Successfully bound socket to interface %s", config.Interface)
+						}
+					}
+				}
+
+				// Apply firewall mark if requested (Linux only)
+				if config.FwMark != 0 && runtime.GOOS == "linux" {
+					if err := setFwMark(intFd, config.FwMark); err != nil {
+						operr = fmt.Errorf("failed to set SO_MARK=%d: %v", config.FwMark, err)
+						logger.Printf("SO_MARK failed: %v", operr)
 					} else {
-						debugf("Fallback: Successfully bound socket to interface %s", config.Interface)
+						debugf("Linux: Set SO_MARK=%d on socket", config.FwMark)
 					}
 				}
 			}
