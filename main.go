@@ -436,20 +436,28 @@ func raceConnections(ctx context.Context, dialer *net.Dialer, ipv4, ipv6 net.IP,
 	}
 
 	results := make(chan connResult, 2)
+	// fallback is closed when IPv6 fails, so IPv4 starts immediately
+	// instead of waiting the full 250ms delay.
+	fallback := make(chan struct{})
 
 	// Start IPv6 connection
 	go func() {
 		addr := net.JoinHostPort(ipv6.String(), port)
 		conn, err := dialer.DialContext(ctx, "tcp6", addr)
+		if err != nil {
+			close(fallback)
+		}
 		results <- connResult{conn: conn, err: err, ipv6: true}
 	}()
 
-	// Start IPv4 connection after 250ms delay
+	// Start IPv4 connection after 250ms delay or immediate IPv6 failure
 	go func() {
 		select {
 		case <-ctx.Done():
 			results <- connResult{err: ctx.Err(), ipv6: false}
 			return
+		case <-fallback:
+			debugf("Happy Eyeballs: IPv6 failed early, starting IPv4 immediately")
 		case <-time.After(250 * time.Millisecond):
 		}
 
