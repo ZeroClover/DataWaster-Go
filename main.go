@@ -1136,8 +1136,8 @@ func createHTTPClient() *http.Client {
 	}
 
 	transport := &http.Transport{
-		MaxIdleConns:        10,
-		MaxIdleConnsPerHost: 10,
+		MaxIdleConns:        config.Parallel + 2,
+		MaxIdleConnsPerHost: config.Parallel + 2,
 		IdleConnTimeout:     30 * time.Second,
 		DisableKeepAlives:   false,
 	}
