@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -1334,10 +1333,8 @@ func uploadWorker(workerID int) {
 		case <-ctx.Done():
 			return
 		default:
-			data := make([]byte, uploadSize)
-
 			reader := &statsReader{
-				reader: bytes.NewReader(data),
+				reader: io.LimitReader(&zeroReader{}, uploadSize),
 				size:   uploadSize,
 			}
 
@@ -1352,6 +1349,14 @@ func uploadWorker(workerID int) {
 			resp.Body.Close()
 		}
 	}
+}
+
+// zeroReader is an io.Reader that returns zero-valued bytes without allocating memory.
+type zeroReader struct{}
+
+func (z *zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
 }
 
 // Custom reader that updates stats during upload
